@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from hashlib import sha256
 from html import escape
 from io import BytesIO
 import logging
@@ -20,6 +21,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramUnauthorizedError
 from aiogram.filters import BaseFilter, Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
 from .database import AttemptChoice, Database, DbAnswer, DbQuestion
@@ -2165,23 +2167,66 @@ async def run_bot() -> None:
     bot_username = me.username
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
-    health_runner = await start_health_server()
-    await dispatcher.start_polling(bot)
-    if health_runner is not None:
-        await health_runner.cleanup()
-
-
-async def start_health_server() -> web.AppRunner | None:
     port = os.getenv("PORT")
+    external_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    if port and external_url:
+        await run_webhook(bot, dispatcher, token, external_url, int(port))
+        return
+
+    await bot.delete_webhook(drop_pending_updates=False)
+    health_runner = await start_health_server(port)
+    try:
+        await dispatcher.start_polling(bot)
+    finally:
+        if health_runner is not None:
+            await health_runner.cleanup()
+        await bot.session.close()
+
+
+async def run_webhook(bot: Bot, dispatcher: Dispatcher, token: str, external_url: str, port: int) -> None:
+    webhook_path = "/webhook/" + sha256(token.encode()).hexdigest()[:32]
+    webhook_url = external_url.rstrip("/") + webhook_path
+    secret_token = os.getenv("WEBHOOK_SECRET") or sha256(("webhook:" + token).encode()).hexdigest()
+
+    app = web.Application()
+    app.router.add_get("/", health_response)
+    app.router.add_get("/health", health_response)
+    SimpleRequestHandler(
+        dispatcher=dispatcher,
+        bot=bot,
+        secret_token=secret_token,
+    ).register(app, path=webhook_path)
+    setup_application(app, dispatcher, bot=bot)
+
+    await bot.set_webhook(
+        webhook_url,
+        secret_token=secret_token,
+        drop_pending_updates=False,
+    )
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info("Webhook server started on port %s", port)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
+
+
+async def health_response(_: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+async def start_health_server(port: str | None = None) -> web.AppRunner | None:
     if not port:
         return None
 
-    async def health(_: web.Request) -> web.Response:
-        return web.Response(text="ok")
-
     app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
+    app.router.add_get("/", health_response)
+    app.router.add_get("/health", health_response)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(port))
