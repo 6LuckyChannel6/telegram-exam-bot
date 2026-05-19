@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import secrets
 import sqlite3
@@ -50,6 +51,7 @@ class Database:
         self.location = str(path)
         self.is_postgres = self.location.startswith(("postgres://", "postgresql://"))
         self.path = None if self.is_postgres else Path(path)
+        self._postgres_pool: Any | None = None
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -533,29 +535,73 @@ class Database:
             )
             test_id = int(cursor.lastrowid)
 
-            for question_position, question in enumerate(parsed_test.questions, start=1):
-                question_cursor = connection.execute(
-                    """
-                    INSERT INTO questions (test_id, text, position)
-                    VALUES (?, ?, ?)
-                    """,
-                    (test_id, question.text, question_position),
+            if self.is_postgres and parsed_test.questions:
+                question_placeholders = ",".join(
+                    "(?, ?, ?)" for _ in parsed_test.questions
                 )
-                question_id = int(question_cursor.lastrowid)
+                question_params: list[Any] = []
+                for question_position, question in enumerate(parsed_test.questions, start=1):
+                    question_params.extend((test_id, question.text, question_position))
 
-                for answer_position, answer in enumerate(question.answers, start=1):
+                question_cursor = connection.execute(
+                    f"""
+                    INSERT INTO questions (test_id, text, position)
+                    VALUES {question_placeholders}
+                    RETURNING id
+                    """,
+                    question_params,
+                )
+                question_ids = [int(row["id"]) for row in question_cursor.fetchall()]
+
+                answer_rows: list[tuple[int, str, int, int]] = []
+                for question_id, question in zip(question_ids, parsed_test.questions):
+                    for answer_position, answer in enumerate(question.answers, start=1):
+                        answer_rows.append(
+                            (
+                                question_id,
+                                answer,
+                                1 if answer_position - 1 == question.correct_answer_index else 0,
+                                answer_position,
+                            )
+                        )
+                if answer_rows:
+                    answer_placeholders = ",".join("(?, ?, ?, ?)" for _ in answer_rows)
+                    answer_params = [
+                        value
+                        for answer_row in answer_rows
+                        for value in answer_row
+                    ]
                     connection.execute(
-                        """
+                        f"""
                         INSERT INTO answers (question_id, text, is_correct, position)
-                        VALUES (?, ?, ?, ?)
+                        VALUES {answer_placeholders}
                         """,
-                        (
-                            question_id,
-                            answer,
-                            1 if answer_position - 1 == question.correct_answer_index else 0,
-                            answer_position,
-                        ),
+                        answer_params,
                     )
+            else:
+                for question_position, question in enumerate(parsed_test.questions, start=1):
+                    question_cursor = connection.execute(
+                        """
+                        INSERT INTO questions (test_id, text, position)
+                        VALUES (?, ?, ?)
+                        """,
+                        (test_id, question.text, question_position),
+                    )
+                    question_id = int(question_cursor.lastrowid)
+
+                    for answer_position, answer in enumerate(question.answers, start=1):
+                        connection.execute(
+                            """
+                            INSERT INTO answers (question_id, text, is_correct, position)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (
+                                question_id,
+                                answer,
+                                1 if answer_position - 1 == question.correct_answer_index else 0,
+                                answer_position,
+                            ),
+                        )
 
         return test_id
 
@@ -597,43 +643,6 @@ class Database:
             if test_row is None:
                 return None
 
-            question_rows = connection.execute(
-                """
-                SELECT id, text
-                FROM questions
-                WHERE test_id = ?
-                ORDER BY position ASC
-                """,
-                (test_id,),
-            ).fetchall()
-
-            questions: list[DbQuestion] = []
-            for question_row in question_rows:
-                answer_rows = connection.execute(
-                    """
-                    SELECT id, text, is_correct
-                    FROM answers
-                    WHERE question_id = ?
-                    ORDER BY position ASC
-                    """,
-                    (question_row["id"],),
-                ).fetchall()
-                answers = tuple(
-                    DbAnswer(
-                        id=int(answer_row["id"]),
-                        text=str(answer_row["text"]),
-                        is_correct=bool(answer_row["is_correct"]),
-                    )
-                    for answer_row in answer_rows
-                )
-                questions.append(
-                    DbQuestion(
-                        id=int(question_row["id"]),
-                        text=str(question_row["text"]),
-                        answers=answers,
-                    )
-                )
-
             return DbTest(
                 id=int(test_row["id"]),
                 owner_id=int(test_row["owner_id"]),
@@ -646,7 +655,7 @@ class Database:
                     if test_row["source_test_id"] is not None
                     else None
                 ),
-                questions=tuple(questions),
+                questions=self._load_questions(connection, test_id),
             )
 
     def admin_get_test(self, test_id: int) -> DbTest | None:
@@ -662,42 +671,6 @@ class Database:
             if test_row is None:
                 return None
 
-            question_rows = connection.execute(
-                """
-                SELECT id, text
-                FROM questions
-                WHERE test_id = ?
-                ORDER BY position ASC
-                """,
-                (test_id,),
-            ).fetchall()
-
-            questions: list[DbQuestion] = []
-            for question_row in question_rows:
-                answer_rows = connection.execute(
-                    """
-                    SELECT id, text, is_correct
-                    FROM answers
-                    WHERE question_id = ?
-                    ORDER BY position ASC
-                    """,
-                    (question_row["id"],),
-                ).fetchall()
-                questions.append(
-                    DbQuestion(
-                        id=int(question_row["id"]),
-                        text=str(question_row["text"]),
-                        answers=tuple(
-                            DbAnswer(
-                                id=int(answer_row["id"]),
-                                text=str(answer_row["text"]),
-                                is_correct=bool(answer_row["is_correct"]),
-                            )
-                            for answer_row in answer_rows
-                        ),
-                    )
-                )
-
             return DbTest(
                 id=int(test_row["id"]),
                 owner_id=int(test_row["owner_id"]),
@@ -710,7 +683,7 @@ class Database:
                     if test_row["source_test_id"] is not None
                     else None
                 ),
-                questions=tuple(questions),
+                questions=self._load_questions(connection, test_id),
             )
 
     def delete_test(self, test_id: int, owner_id: int) -> bool:
@@ -938,32 +911,66 @@ class Database:
                 (test_id, user_id),
             ).fetchall()
 
-            questions: list[DbQuestion] = []
-            for question_row in question_rows:
-                answer_rows = connection.execute(
-                    """
-                    SELECT id, text, is_correct
-                    FROM answers
-                    WHERE question_id = ?
-                    ORDER BY position ASC
-                    """,
-                    (question_row["id"],),
-                ).fetchall()
-                questions.append(
-                    DbQuestion(
-                        id=int(question_row["id"]),
-                        text=str(question_row["text"]),
-                        answers=tuple(
-                            DbAnswer(
-                                id=int(answer_row["id"]),
-                                text=str(answer_row["text"]),
-                                is_correct=bool(answer_row["is_correct"]),
-                            )
-                            for answer_row in answer_rows
-                        ),
-                    )
+            question_ids = [int(question_row["id"]) for question_row in question_rows]
+            answers_by_question = self._load_answers_for_questions(connection, question_ids)
+            return [
+                DbQuestion(
+                    id=int(question_row["id"]),
+                    text=str(question_row["text"]),
+                    answers=tuple(answers_by_question.get(int(question_row["id"]), [])),
                 )
-            return questions
+                for question_row in question_rows
+            ]
+
+    def _load_questions(self, connection: Any, test_id: int) -> tuple[DbQuestion, ...]:
+        question_rows = connection.execute(
+            """
+            SELECT id, text
+            FROM questions
+            WHERE test_id = ?
+            ORDER BY position ASC
+            """,
+            (test_id,),
+        ).fetchall()
+        question_ids = [int(question_row["id"]) for question_row in question_rows]
+        answers_by_question = self._load_answers_for_questions(connection, question_ids)
+        return tuple(
+            DbQuestion(
+                id=int(question_row["id"]),
+                text=str(question_row["text"]),
+                answers=tuple(answers_by_question.get(int(question_row["id"]), [])),
+            )
+            for question_row in question_rows
+        )
+
+    def _load_answers_for_questions(
+        self,
+        connection: Any,
+        question_ids: list[int],
+    ) -> dict[int, list[DbAnswer]]:
+        if not question_ids:
+            return {}
+        placeholders = ",".join("?" for _ in question_ids)
+        answer_rows = connection.execute(
+            f"""
+            SELECT id, question_id, text, is_correct
+            FROM answers
+            WHERE question_id IN ({placeholders})
+            ORDER BY question_id ASC, position ASC
+            """,
+            question_ids,
+        ).fetchall()
+        answers_by_question: dict[int, list[DbAnswer]] = {}
+        for answer_row in answer_rows:
+            question_id = int(answer_row["question_id"])
+            answers_by_question.setdefault(question_id, []).append(
+                DbAnswer(
+                    id=int(answer_row["id"]),
+                    text=str(answer_row["text"]),
+                    is_correct=bool(answer_row["is_correct"]),
+                )
+            )
+        return answers_by_question
 
     def save_attempt(
         self,
@@ -997,21 +1004,27 @@ class Database:
             )
             attempt_id = int(cursor.lastrowid)
 
-            for choice in choices:
+            if choices:
+                placeholders = ",".join("(?, ?, ?, ?, ?)" for _ in choices)
+                params: list[int] = []
+                for choice in choices:
+                    params.extend(
+                        (
+                            attempt_id,
+                            choice.question_id,
+                            choice.selected_answer_id,
+                            choice.correct_answer_id,
+                            1 if choice.is_correct else 0,
+                        )
+                    )
                 connection.execute(
-                    """
+                    f"""
                     INSERT INTO attempt_answers (
                         attempt_id, question_id, selected_answer_id, correct_answer_id, is_correct
                     )
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES {placeholders}
                     """,
-                    (
-                        attempt_id,
-                        choice.question_id,
-                        choice.selected_answer_id,
-                        choice.correct_answer_id,
-                        1 if choice.is_correct else 0,
-                    ),
+                    params,
                 )
 
         return attempt_id, correct_count, total_count, percent
@@ -1083,12 +1096,34 @@ class Database:
 
     def _connect(self) -> Any:
         if self.is_postgres:
-            return _PostgresConnection(self.location)
+            pool = self._postgres_connection_pool()
+            return _PostgresConnection(pool.getconn(), pool)
         assert self.path is not None
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
+
+    def _postgres_connection_pool(self) -> Any:
+        if self._postgres_pool is None:
+            from psycopg.rows import dict_row
+            from psycopg_pool import ConnectionPool
+
+            pool_size = max(1, int(os.getenv("EXAM_BOT_DB_POOL_SIZE", "5")))
+            self._postgres_pool = ConnectionPool(
+                conninfo=self.location,
+                min_size=1,
+                max_size=pool_size,
+                kwargs={"row_factory": dict_row},
+                check=ConnectionPool.check_connection,
+                open=True,
+            )
+        return self._postgres_pool
+
+    def close(self) -> None:
+        if self._postgres_pool is not None:
+            self._postgres_pool.close()
+            self._postgres_pool = None
 
     def _repair_rtf_fallback_artifacts(self, connection: sqlite3.Connection) -> None:
         for table, column in (
@@ -1168,11 +1203,10 @@ class _PostgresCursor:
 
 
 class _PostgresConnection:
-    def __init__(self, database_url: str) -> None:
-        import psycopg
-        from psycopg.rows import dict_row
-
-        self.connection = psycopg.connect(database_url, row_factory=dict_row)
+    def __init__(self, connection: Any, pool: Any) -> None:
+        self.connection = connection
+        self.pool = pool
+        self.closed = False
 
     def execute(
         self,
@@ -1189,7 +1223,9 @@ class _PostgresConnection:
         self.connection.rollback()
 
     def close(self) -> None:
-        self.connection.close()
+        if not self.closed:
+            self.pool.putconn(self.connection)
+            self.closed = True
 
 
 def _postgres_sql(sql: str) -> str:
@@ -1200,6 +1236,8 @@ def _postgres_sql(sql: str) -> str:
 
 def _insert_returning_table(sql: str) -> str | None:
     normalized = " ".join(sql.lower().split())
+    if " returning " in f" {normalized} ":
+        return None
     for table in ("tests", "questions", "attempts"):
         if normalized.startswith(f"insert into {table} "):
             return table
