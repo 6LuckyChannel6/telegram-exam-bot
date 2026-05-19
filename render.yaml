@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: gentest-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m telegram_exam_bot
+    envVars:
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      - key: EXAM_BOT_DB_PATH
+        value: data/exam_bot.sqlite3
