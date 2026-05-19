@@ -8,5 +8,3 @@ services:
     envVars:
       - key: PYTHONDONTWRITEBYTECODE
         value: "1"
-      - key: EXAM_BOT_DB_PATH
-        value: data/exam_bot.sqlite3

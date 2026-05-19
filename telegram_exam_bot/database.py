@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import secrets
 import sqlite3
+from typing import Any
 
 from .parser import ParsedTest
 
@@ -46,10 +47,17 @@ class AttemptChoice:
 
 class Database:
     def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.location = str(path)
+        self.is_postgres = self.location.startswith(("postgres://", "postgresql://"))
+        self.path = None if self.is_postgres else Path(path)
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def initialize(self) -> None:
+        if self.is_postgres:
+            self._initialize_postgres()
+            return
+
         with self._connection() as connection:
             connection.executescript(
                 """
@@ -152,6 +160,132 @@ class Database:
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tests_source ON tests(source_test_id)"
+            )
+            self._repair_rtf_fallback_artifacts(connection)
+
+    def _initialize_postgres(self) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tests (
+                    id BIGSERIAL PRIMARY KEY,
+                    owner_id BIGINT NOT NULL,
+                    title TEXT NOT NULL,
+                    source_filename TEXT NOT NULL,
+                    question_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    source_test_id BIGINT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS questions (
+                    id BIGSERIAL PRIMARY KEY,
+                    test_id BIGINT NOT NULL REFERENCES tests(id) ON DELETE CASCADE,
+                    text TEXT NOT NULL,
+                    position INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS answers (
+                    id BIGSERIAL PRIMARY KEY,
+                    question_id BIGINT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+                    text TEXT NOT NULL,
+                    is_correct INTEGER NOT NULL,
+                    position INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS attempts (
+                    id BIGSERIAL PRIMARY KEY,
+                    test_id BIGINT NOT NULL REFERENCES tests(id) ON DELETE CASCADE,
+                    user_id BIGINT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    correct_count INTEGER NOT NULL,
+                    total_count INTEGER NOT NULL,
+                    percent REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS attempt_answers (
+                    id BIGSERIAL PRIMARY KEY,
+                    attempt_id BIGINT NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+                    question_id BIGINT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+                    selected_answer_id BIGINT NOT NULL REFERENCES answers(id) ON DELETE CASCADE,
+                    correct_answer_id BIGINT NOT NULL REFERENCES answers(id) ON DELETE CASCADE,
+                    is_correct INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id BIGINT PRIMARY KEY,
+                    language TEXT NOT NULL DEFAULT 'ru',
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    last_seen_at TEXT NOT NULL,
+                    is_blocked INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS test_shares (
+                    token TEXT PRIMARY KEY,
+                    test_id BIGINT NOT NULL REFERENCES tests(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_tests_owner ON tests(owner_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_attempts_user ON attempts(user_id, finished_at)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_users_seen ON users(last_seen_at)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_test_shares_test ON test_shares(test_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_tests_source ON tests(source_test_id)")
+
+            now = _utc_now()
+            connection.execute(
+                """
+                INSERT INTO users (user_id, last_seen_at)
+                SELECT DISTINCT owner_id, ? FROM tests
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                INSERT INTO users (user_id, last_seen_at)
+                SELECT DISTINCT user_id, ? FROM attempts
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (now,),
             )
             self._repair_rtf_fallback_artifacts(connection)
 
@@ -677,7 +811,9 @@ class Database:
                         (token, test_id, _utc_now()),
                     )
                     return token
-                except sqlite3.IntegrityError:
+                except Exception as exc:
+                    if not _is_integrity_error(exc):
+                        raise
                     continue
 
         return None
@@ -934,7 +1070,7 @@ class Database:
             )
 
     @contextmanager
-    def _connection(self) -> sqlite3.Connection:
+    def _connection(self) -> Any:
         connection = self._connect()
         try:
             yield connection
@@ -945,7 +1081,10 @@ class Database:
         finally:
             connection.close()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> Any:
+        if self.is_postgres:
+            return _PostgresConnection(self.location)
+        assert self.path is not None
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -967,17 +1106,110 @@ class Database:
 
     def _ensure_column(
         self,
-        connection: sqlite3.Connection,
+        connection: Any,
         table: str,
         column: str,
         definition: str,
     ) -> None:
+        if self.is_postgres:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = ? AND column_name = ?
+                """,
+                (table, column),
+            ).fetchone()
+            if row is None:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            return
+
         columns = {
             str(row["name"])
             for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
         }
         if column not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+class _PostgresRow(dict):
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+
+class _PostgresCursor:
+    def __init__(self, cursor: Any) -> None:
+        self.cursor = cursor
+        self.lastrowid: int | None = None
+
+    @property
+    def rowcount(self) -> int:
+        return int(self.cursor.rowcount)
+
+    def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> "_PostgresCursor":
+        sql = _postgres_sql(sql)
+        table = _insert_returning_table(sql)
+        if table:
+            sql = sql.rstrip().rstrip(";") + " RETURNING id"
+        self.cursor.execute(sql, tuple(params))
+        if table:
+            row = self.cursor.fetchone()
+            self.lastrowid = int(row["id"])
+        return self
+
+    def fetchone(self) -> _PostgresRow | None:
+        row = self.cursor.fetchone()
+        return _PostgresRow(row) if row is not None else None
+
+    def fetchall(self) -> list[_PostgresRow]:
+        return [_PostgresRow(row) for row in self.cursor.fetchall()]
+
+
+class _PostgresConnection:
+    def __init__(self, database_url: str) -> None:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        self.connection = psycopg.connect(database_url, row_factory=dict_row)
+
+    def execute(
+        self,
+        sql: str,
+        params: tuple[Any, ...] | list[Any] = (),
+    ) -> _PostgresCursor:
+        cursor = _PostgresCursor(self.connection.cursor())
+        return cursor.execute(sql, params)
+
+    def commit(self) -> None:
+        self.connection.commit()
+
+    def rollback(self) -> None:
+        self.connection.rollback()
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+def _postgres_sql(sql: str) -> str:
+    converted = sql.replace("%", "%%").replace("?", "%s")
+    converted = converted.replace("round(avg(percent), 2)", "round(avg(percent)::numeric, 2)")
+    return converted
+
+
+def _insert_returning_table(sql: str) -> str | None:
+    normalized = " ".join(sql.lower().split())
+    for table in ("tests", "questions", "attempts"):
+        if normalized.startswith(f"insert into {table} "):
+            return table
+    return None
+
+
+def _is_integrity_error(exc: Exception) -> bool:
+    if isinstance(exc, sqlite3.IntegrityError):
+        return True
+    return exc.__class__.__name__ in {"IntegrityError", "UniqueViolation"}
 
 
 def _utc_now() -> str:

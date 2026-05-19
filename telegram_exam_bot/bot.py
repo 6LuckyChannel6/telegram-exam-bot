@@ -2145,8 +2145,8 @@ async def run_bot() -> None:
     if not TOKEN_RE.match(token) or any(part in normalized_token for part in PLACEHOLDER_TOKEN_PARTS):
         raise RuntimeError("BOT_TOKEN is invalid.")
 
-    db_path = os.getenv("EXAM_BOT_DB_PATH", "data/exam_bot.sqlite3")
-    database = Database(db_path)
+    db_location = os.getenv("DATABASE_URL") or os.getenv("EXAM_BOT_DB_PATH", "data/exam_bot.sqlite3")
+    database = Database(db_location)
     database.initialize()
     admin_ids = parse_admin_ids(os.getenv("BOT_ADMIN_IDS", ""))
 
