@@ -1,4 +1,4 @@
-from telegram_exam_bot.database import AttemptChoice, Database
+from telegram_exam_bot.database import AttemptChoice, Database, _PostgresCursor
 from telegram_exam_bot.parser import parse_marked_lines
 
 
@@ -221,3 +221,19 @@ def test_database_mistake_questions_for_test(tmp_path):
 
     assert len(mistakes) == 1
     assert mistakes[0].text == "Q1"
+
+
+def test_postgres_cursor_can_be_iterated_like_sqlite_cursor():
+    class FakeCursor:
+        rowcount = 2
+
+        def execute(self, sql, params):
+            self.sql = sql
+            self.params = params
+
+        def fetchall(self):
+            return [{"id": 1}, {"id": 2}]
+
+    cursor = _PostgresCursor(FakeCursor()).execute("SELECT id FROM tests WHERE owner_id = ?", (42,))
+
+    assert list(cursor) == [{"id": 1}, {"id": 2}]

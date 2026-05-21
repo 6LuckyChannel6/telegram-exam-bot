@@ -1166,6 +1166,9 @@ class _PostgresCursor:
     def fetchall(self) -> list[_PostgresRow]:
         return [_PostgresRow(row) for row in self.cursor.fetchall()]
 
+    def __iter__(self):
+        return iter(self.fetchall())
+
 
 class _PostgresConnection:
     def __init__(self, database_url: str) -> None:
